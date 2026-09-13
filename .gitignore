@@ -33,6 +33,7 @@ ENV/
 env/
 env.bak/
 venv.bak/
+chatbot/
 
 # Environment Variables & Secrets
 .env

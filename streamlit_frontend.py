@@ -4,7 +4,7 @@
 import os
 import uuid
 import streamlit as st
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage, AIMessage
 from langgraph_backend import chatbot, retrieve_all_threads
 
 # Set environment variable for process/app identification
@@ -55,6 +55,28 @@ def add_thread(thread_id: str) -> None:
     if thread_id not in st.session_state['chat_thread']:
         st.session_state['chat_thread'].append(thread_id)
 
+def delete_thread(thread_id: str) -> None:
+    """
+    Delete a conversation from the UI.
+    Does NOT delete data from SQLite.
+    """
+
+    if thread_id in st.session_state["chat_thread"]:
+        st.session_state["chat_thread"].remove(thread_id)
+
+    if thread_id in st.session_state["thread_titles"]:
+        del st.session_state["thread_titles"][thread_id]
+
+    # If the currently opened chat is deleted
+    if st.session_state["thread_id"] == thread_id:
+
+        new_thread = generate_thread_id()
+
+        st.session_state["thread_id"] = new_thread
+        st.session_state["message_history"] = []
+
+        add_thread(new_thread)
+
 
 def load_conversation(thread_id: str) -> list:
     """
@@ -101,11 +123,12 @@ if 'message_history' not in st.session_state:
 
 # 2. thread_id: Active conversation thread identifier
 if 'thread_id' not in st.session_state:
-    st.session_state['thread_id'] = str(generate_thread_id())
+    st.session_state['thread_id'] = generate_thread_id()
 
 # 3. chat_thread: List of all thread IDs created in the current user session
 if 'chat_thread' not in st.session_state:
-    st.session_state['chat_thread'] = []
+    stored_threads = retrieve_all_threads()
+    st.session_state['chat_thread'] = stored_threads if stored_threads else [st.session_state['thread_id']]
 
 # 4. thread_titles: Mapping of thread_id -> custom display title (first prompt snippet)
 if 'thread_titles' not in st.session_state:
@@ -124,35 +147,75 @@ st.sidebar.title('LangGraph Chatbot')
 if st.sidebar.button('➕ New Chat', use_container_width=True):
     reset_chat()
 
+if st.sidebar.button("🔄 Reset Chat"):
+    reset_chat()
+    st.rerun()
+
 st.sidebar.header('My Conversations')
 
 # Render existing chat threads in reverse chronological order (newest first)
-for thread_id in st.session_state['chat_thread'][::-1]:
-    # Use saved thread title or fallback to truncated thread ID
-    title = st.session_state['thread_titles'].get(
+for thread_id in st.session_state["chat_thread"][::-1]:
+
+    title = st.session_state["thread_titles"].get(
         thread_id,
         f"Chat-{thread_id[:8]}"
     )
-    
-    # Clicking a thread button switches the active conversation
-    if st.sidebar.button(title, key=f"btn_{thread_id}", use_container_width=True):
-        st.session_state['thread_id'] = thread_id
-        
-        # Retrieve message history for the selected thread from LangGraph checkpoint
-        messages = load_conversation(thread_id)
-        
-        # Convert LangChain message objects into UI-friendly format
-        tmp_msg = []
-        for msg in messages:
-            role = "user" if isinstance(msg, HumanMessage) else "assistant"
-            content = extract_content(msg)
-            tmp_msg.append({
-                "role": role,
-                "content": content
-            })
-        
-        st.session_state['message_history'] = tmp_msg
-        st.rerun()
+
+    col1, col2 = st.sidebar.columns([4, 2])
+
+    # ==========================
+    # OPEN CHAT BUTTON
+    # ==========================
+    with col1:
+
+        if st.button(
+            title,
+            key=f"open_{thread_id}",
+            use_container_width=True
+        ):
+
+            st.session_state["thread_id"] = thread_id
+
+            messages = load_conversation(thread_id)
+
+            tmp_msg = []
+
+            for msg in messages:
+
+                if isinstance(msg, HumanMessage):
+                    role = "user"
+
+                elif isinstance(msg, ToolMessage):
+                    continue
+
+                else:
+                    role = "assistant"
+
+                tmp_msg.append(
+                    {
+                        "role": role,
+                        "content": extract_content(msg)
+                    }
+                )
+
+            st.session_state["message_history"] = tmp_msg
+
+            st.rerun()
+
+    # ==========================
+    # DELETE BUTTON
+    # ==========================
+    with col2:
+
+        if st.button(
+            "❌",
+            key=f"delete_{thread_id}",
+            use_container_width=True
+        ):
+
+            delete_thread(thread_id)
+
+            st.rerun()
 
 
 # ==============================================================================
@@ -167,65 +230,126 @@ for message in st.session_state['message_history']:
 # ==============================================================================
 # SECTION 6: USER INPUT HANDLING & STREAMING RESPONSE
 # ==============================================================================
-# Render the bottom chat input bar
-user_input = st.chat_input('Type Here.....')
+user_input = st.chat_input("Type Here.....")
 
 if user_input:
-    # 1. Record and display the user's message immediately in the UI
-    st.session_state['message_history'].append({
-        'role': 'user',
-        'content': user_input
-    })
 
-    with st.chat_message('user'):
-        st.text(user_input)
+    st.session_state["message_history"].append(
+        {
+            "role": "user",
+            "content": user_input
+        }
+    )
 
-    # 2. Prepare LangGraph configuration with the active thread_id for state persistence
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
     config = {
-        'configurable': {
-            'thread_id': st.session_state['thread_id']
+        "configurable": {
+            "thread_id": st.session_state["thread_id"]
         },
-        'metadata': {
-            'thread_id': st.session_state['thread_id']
+        "metadata": {
+            "thread_id": st.session_state["thread_id"]
         },
-        'run_name': 'chat_turn'
+        "run_name": "chat_turn"
     }
 
-    # 3. Stream the LLM response chunk-by-chunk in real-time
-    with st.chat_message('assistant'):
-        placeholder = st.empty()
-        ai_msg = ""
-        current_thread = st.session_state["thread_id"]
+    with st.chat_message("assistant"):
 
-        # Set a meaningful sidebar title from the first 30 characters of the initial prompt
-        if current_thread not in st.session_state['thread_titles']:
-            title = user_input[:30]
-            st.session_state['thread_titles'][current_thread] = title
+        response_placeholder = st.empty()
 
-        # Stream tokens from LangGraph chatbot node
+        full_response = ""
+
+        status_box = None
+
+        used_tools = []
+
+        tool_labels = {
+            "search_web": "🌐 Searching Web",
+            "calculator": "🧮 Calculator",
+            "get_stock_price": "📈 Stock Price Lookup"
+        }
+
         for message_chunk, metadata in chatbot.stream(
-            {'messages': [HumanMessage(content=user_input)]},
+            {
+                "messages": [
+                    HumanMessage(content=user_input)
+                ]
+            },
             config=config,
-            stream_mode='messages'
+            stream_mode="messages"
         ):
-            content = message_chunk.content
 
-            # Handle list of structured content blocks (multimodal / tools / text)
-            if isinstance(content, list):
-                for item in content:
-                    if isinstance(item, dict):
-                        txt = item.get("text", "")
-                        if txt:
-                            ai_msg += txt
-                            placeholder.text(ai_msg)
+            # ---------------------------------------------------------
+            # TOOL EXECUTION EVENTS
+            # ---------------------------------------------------------
+            if isinstance(message_chunk, ToolMessage):
 
-            # Handle plain string content tokens
-            elif isinstance(content, str):
-                ai_msg += content
-                placeholder.text(ai_msg)
+                tool_name = getattr(
+                    message_chunk,
+                    "name",
+                    "unknown_tool"
+                )
 
-    # 4. Append complete assistant response to message history for UI persistence
-    st.session_state['message_history'].append({
-        'role': 'assistant',
-        'content': ai_msg
-    })
+                if tool_name not in used_tools:
+                    used_tools.append(tool_name)
+
+                display_name = tool_labels.get(
+                    tool_name,
+                    tool_name
+                )
+
+                if status_box is None:
+
+                    status_box = st.status(
+                        f"🔧 {display_name}",
+                        expanded=False
+                    )
+
+                else:
+
+                    status_box.update(
+                        label=f"🔧 {display_name}",
+                        state="running",
+                        expanded=False
+                    )
+
+            # ---------------------------------------------------------
+            # AI RESPONSE STREAMING
+            # ---------------------------------------------------------
+            elif isinstance(message_chunk, AIMessage):
+
+                content = extract_content(message_chunk)
+
+                if content:
+
+                    full_response += content
+
+                    response_placeholder.markdown(
+                        full_response
+                    )
+
+        # ---------------------------------------------------------
+        # FINAL TOOL STATUS
+        # ---------------------------------------------------------
+        if status_box:
+
+            readable_tools = [
+                tool_labels.get(t, t)
+                for t in used_tools
+            ]
+
+            status_box.update(
+                label=f"✅ Used: {', '.join(readable_tools)}",
+                state="complete",
+                expanded=False
+            )
+
+        ai_message = full_response
+
+    st.session_state["message_history"].append(
+        {
+            "role": "assistant",
+            "content": ai_message
+        }
+    )
