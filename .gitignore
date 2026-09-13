@@ -50,6 +50,7 @@ chatbot.db-wal
 
 # Streamlit config / cache
 .streamlit/secrets.toml
+.playwright-mcp/
 
 # Operating System Files
 .DS_Store

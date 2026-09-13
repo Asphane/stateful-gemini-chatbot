@@ -4,6 +4,7 @@ langchain-core
 langgraph
 langchain-google-genai
 langchain-community
+langchain-mcp-adapters
 duckduckgo-search
 python-dotenv
 requests

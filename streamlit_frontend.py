@@ -146,9 +146,6 @@ st.sidebar.title('LangGraph Chatbot')
 # Button to start a new chat conversation
 if st.sidebar.button('➕ New Chat', use_container_width=True):
     reset_chat()
-
-if st.sidebar.button("🔄 Reset Chat"):
-    reset_chat()
     st.rerun()
 
 st.sidebar.header('My Conversations')
@@ -224,7 +221,7 @@ for thread_id in st.session_state["chat_thread"][::-1]:
 # Render all previously exchanged messages in the current conversation
 for message in st.session_state['message_history']:
     with st.chat_message(message['role']):
-        st.text(message['content'])
+        st.markdown(message['content'])
 
 
 # ==============================================================================
@@ -233,6 +230,12 @@ for message in st.session_state['message_history']:
 user_input = st.chat_input("Type Here.....")
 
 if user_input:
+
+    # Auto-generate title for current thread from first message
+    if st.session_state["thread_id"] not in st.session_state["thread_titles"]:
+        st.session_state["thread_titles"][st.session_state["thread_id"]] = (
+            user_input[:25] + ("..." if len(user_input) > 25 else "")
+        )
 
     st.session_state["message_history"].append(
         {
@@ -257,19 +260,26 @@ if user_input:
     with st.chat_message("assistant"):
 
         response_placeholder = st.empty()
-
         full_response = ""
-
         status_box = None
-
         used_tools = []
 
         tool_labels = {
             "search_web": "🌐 Searching Web",
             "calculator": "🧮 Calculator",
-            "get_stock_price": "📈 Stock Price Lookup"
+            "get_stock_price": "📈 Stock Price Lookup",
+            "browser_navigate": "🌐 Navigating Browser",
+            "browser_snapshot": "📸 Taking Page Snapshot",
+            "browser_click": "🖱️ Clicking Element",
+            "browser_take_screenshot": "📷 Capturing Screenshot",
+            "add_expense": "💰 Adding Expense",
+            "list_expenses": "📊 Listing Expenses",
+            "summarize": "📋 Summarizing Expenses"
         }
 
+        # ---------------------------------------------------------
+        # STREAM TOKENS AND TOOL EVENTS
+        # ---------------------------------------------------------
         for message_chunk, metadata in chatbot.stream(
             {
                 "messages": [
@@ -280,11 +290,8 @@ if user_input:
             stream_mode="messages"
         ):
 
-            # ---------------------------------------------------------
-            # TOOL EXECUTION EVENTS
-            # ---------------------------------------------------------
+            # 1. Tool execution events
             if isinstance(message_chunk, ToolMessage):
-
                 tool_name = getattr(
                     message_chunk,
                     "name",
@@ -300,45 +307,30 @@ if user_input:
                 )
 
                 if status_box is None:
-
                     status_box = st.status(
                         f"🔧 {display_name}",
                         expanded=False
                     )
-
                 else:
-
                     status_box.update(
                         label=f"🔧 {display_name}",
                         state="running",
                         expanded=False
                     )
 
-            # ---------------------------------------------------------
-            # AI RESPONSE STREAMING
-            # ---------------------------------------------------------
+            # 2. AI response token streaming
             elif isinstance(message_chunk, AIMessage):
-
                 content = extract_content(message_chunk)
-
                 if content:
-
                     full_response += content
+                    response_placeholder.markdown(full_response)
 
-                    response_placeholder.markdown(
-                        full_response
-                    )
-
-        # ---------------------------------------------------------
-        # FINAL TOOL STATUS
-        # ---------------------------------------------------------
+        # 3. Final tool status update
         if status_box:
-
             readable_tools = [
                 tool_labels.get(t, t)
                 for t in used_tools
             ]
-
             status_box.update(
                 label=f"✅ Used: {', '.join(readable_tools)}",
                 state="complete",

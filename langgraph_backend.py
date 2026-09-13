@@ -13,15 +13,36 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_community.tools import DuckDuckGoSearchRun
-from langchain_core.tools import tool
+from langchain_core.tools import tool, BaseTool, StructuredTool
+from langchain_mcp_adapters.client import MultiServerMCPClient
+import aiosqlite
+import asyncio
+import threading
 
 # Load environment variables (e.g., GOOGLE_API_KEY) from .env file
 load_dotenv()
 
 search_tool = DuckDuckGoSearchRun(region='us-en')
 
+# Dedicated async loop for backend tasks
+_ASYNC_LOOP = asyncio.new_event_loop()
+_ASYNC_THREAD = threading.Thread(target=_ASYNC_LOOP.run_forever, daemon=True)
+_ASYNC_THREAD.start()
+
+def _submit_async(coro):
+    return asyncio.run_coroutine_threadsafe(coro, _ASYNC_LOOP)
+
+
+def run_async(coro):
+    return _submit_async(coro).result()
+
+
+def submit_async_task(coro):
+    """Schedule a coroutine on the backend event loop."""
+    return _submit_async(coro)
 
 # ==============================================================================
 # SECTION 2: MODEL INITIALIZATION & DATABASE CONNECTION
@@ -37,15 +58,19 @@ conn = sqlite3.connect(database='chatbot.db', check_same_thread=False)
 checkpointer = SqliteSaver(conn=conn)
 
 SYSTEM_PROMPT = """
-You are a helpful AI assistant.
+You are a versatile, intelligent AI assistant equipped with a rich set of tools.
 
-Rules:
+Available capabilities:
+1. Mathematical operations via the `calculator` tool.
+2. Real-time stock market data via `get_stock_price`.
+3. General web search via `search_web`.
+4. Browser automation via Playwright MCP tools (`browser_navigate`, `browser_snapshot`, `browser_click`, etc.) for visiting web pages and extracting live content from URLs.
+5. Personal finance & expense management via Expense MCP tools (`add_expense`, `list_expenses`, `summarize`).
 
-1. Use calculator for mathematical operations.
-2. Use get_stock_price for stock queries.
-3. Use search_web for current events and recent information.
-4. Be concise and factual.
-5. Never hallucinate stock prices.
+Guidelines:
+- When a user asks what you can do, summarize all your capabilities (math, stocks, web search, web browser navigation, and expense management).
+- When given a specific URL or webpage to inspect, use browser automation (`browser_navigate`) or search tools to extract and inspect the page content.
+- Be concise, clear, and factual. Never hallucinate real-time data or stock prices.
 """
 
 
@@ -63,7 +88,7 @@ class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 
 # ==============================================================================
-# SECTION 4: TOOLS
+# SECTION 4: TOOLS & MCP SERVERS
 # ==============================================================================
 
 @tool
@@ -126,22 +151,69 @@ def get_stock_price(symbol: str) -> dict:
 def search_web(query: str) -> str:
     """Search the web for current information relevant to the user's query."""
     print(f"SEARCH TOOL CALLED: {query}")
-
-    result = search_tool.invoke(query)
+    
     try:
+        result = search_tool.invoke(query)
         return str(result)
 
     except Exception as e:
-
         return f"Search failed: {e}"
 
 
-tools = [calculator, get_stock_price, search_web]
-llm_with_tools = llm.bind_tools(tools)
-tool_node = ToolNode(tools)
+# Multi-Server MCP Client configuration
+MCP_SERVERS = {
+    "expense": {
+        "transport": "streamable_http",
+        "url": "https://splendid-gold-dingo.fastmcp.app/mcp"
+    },
+    "playwright": {
+        "transport": "stdio",
+        "command": "npx",
+        "args": [
+            "-y",
+            "@playwright/mcp@latest"
+        ]
+    }
+}
+
+def _make_sync_tool(t: BaseTool) -> StructuredTool:
+    """Wraps an async MCP tool with a synchronous runner for LangGraph ToolNode compatibility."""
+    def sync_run(*args, **kwargs):
+        input_data = kwargs if kwargs else (args[0] if args else {})
+        return run_async(t.ainvoke(input_data))
+
+    return StructuredTool(
+        name=t.name,
+        description=t.description,
+        args_schema=t.args_schema,
+        func=sync_run,
+        coroutine=t.coroutine,
+    )
+
+def load_mcp_tools() -> list[BaseTool]:
+    all_mcp_tools = []
+    for server_name, srv_config in MCP_SERVERS.items():
+        try:
+            client = MultiServerMCPClient({server_name: srv_config})
+            srv_tools = run_async(client.get_tools())
+            sync_tools = [_make_sync_tool(t) for t in srv_tools]
+            all_mcp_tools.extend(sync_tools)
+
+            print(f"Loaded {len(sync_tools)} tools from MCP server '{server_name}'")
+
+        except Exception as e:
+            print(f"MCP Error on '{server_name}': {e}")
+    return all_mcp_tools
+
+
+mcp_tools = load_mcp_tools()
+tools = [calculator, get_stock_price, search_web, *mcp_tools]
+llm_with_tools = llm.bind_tools(tools) if tools else llm
+tool_node = ToolNode(tools) if tools else None
+
 
 # ==============================================================================
-# SECTION 5: NODE DEFINITIONS (BUSINESS LOGIC)
+# SECTION 5: NODE DEFINITIONS & STATE GRAPH CONSTRUCTION
 # ==============================================================================
 def chat_node(state: ChatState) -> ChatState:
     """
@@ -156,21 +228,23 @@ def chat_node(state: ChatState) -> ChatState:
     return {'messages': [res]}
 
 
-# ==============================================================================
-# SECTION 5: STATE GRAPH CONSTRUCTION & COMPILATION
-# ==============================================================================
 # Initialize StateGraph with defined ChatState schema
 graph = StateGraph(ChatState)
 
 # Add nodes to graph
 graph.add_node("chat", chat_node)
-graph.add_node("tools", tool_node)
-
-# Route tool calls back through the model; finish when the model returns a
-# regular response.
 graph.add_edge(START, "chat")
-graph.add_conditional_edges("chat", tools_condition)
-graph.add_edge("tools", "chat")
+
+# Route tool calls back through the model; finish when the model returns a regular response
+if tool_node:
+    graph.add_node("tools", tool_node)
+    graph.add_conditional_edges("chat", tools_condition, {
+        "tools": "tools",
+        "__end__": END
+    })
+    graph.add_edge("tools", "chat")
+else:
+    graph.add_edge("chat", END)
 
 # Compile graph with SQLite checkpointing enabled for thread persistence
 chatbot = graph.compile(checkpointer=checkpointer)
@@ -188,10 +262,12 @@ def retrieve_all_threads() -> list[str]:
 
     for checkpoint in checkpointer.list(None):
         thread_id = checkpoint.config.get('configurable', {}).get('thread_id')
+
         if thread_id:
             all_threads.add(thread_id)
 
     return list(all_threads)
+
 
 
 # ==============================================================================
